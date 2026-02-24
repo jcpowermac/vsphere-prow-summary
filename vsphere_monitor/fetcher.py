@@ -78,3 +78,52 @@ def fetch(file: str | Path | None = None, *, refresh: bool = False) -> dict[str,
     if file is not None:
         return fetch_from_file(file)
     return fetch_from_api(refresh=refresh)
+
+
+def prow_url_to_build_log_url(prow_url: str) -> str | None:
+    """Convert a Prow UI URL to the GCS build-log.txt URL.
+
+    Example:
+        In:  https://prow.ci.openshift.org/view/gs/test-platform-results/logs/JOB/BUILD_ID
+        Out: https://storage.googleapis.com/test-platform-results/logs/JOB/BUILD_ID/build-log.txt
+    """
+    marker = "/view/gs/"
+    idx = prow_url.find(marker)
+    if idx == -1:
+        return None
+    gcs_path = prow_url[idx + len(marker):]
+    return f"https://storage.googleapis.com/{gcs_path}/build-log.txt"
+
+
+def fetch_build_log(prow_url: str, max_lines: int = 5000) -> tuple[str, list[str]]:
+    """Fetch the build-log.txt for a prow job, returning the tail.
+
+    Streams the log and keeps only the last *max_lines* lines to bound
+    memory usage (build logs can be 10MB+).
+
+    Returns (log_url, lines).
+    Raises ValueError if the URL can't be converted.
+    Raises httpx.HTTPStatusError on fetch failure.
+    """
+    log_url = prow_url_to_build_log_url(prow_url)
+    if log_url is None:
+        raise ValueError(f"Cannot derive build-log URL from: {prow_url}")
+
+    from collections import deque
+
+    tail: deque[str] = deque(maxlen=max_lines)
+
+    with httpx.Client(timeout=120, follow_redirects=True) as client:
+        with client.stream("GET", log_url) as resp:
+            resp.raise_for_status()
+            buf = ""
+            for chunk in resp.iter_text():
+                buf += chunk
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    tail.append(line)
+            # Handle last line without trailing newline
+            if buf:
+                tail.append(buf)
+
+    return log_url, list(tail)

@@ -106,7 +106,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Dispatch to output mode
     if args.interactive:
-        run_interactive(summaries)
+        run_interactive(summaries, file_path=args.file)
     elif args.ask:
         with console.status("[bold cyan]Asking Claude..."):
             answer = ask(summaries, args.ask)
