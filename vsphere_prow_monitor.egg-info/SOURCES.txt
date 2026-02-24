@@ -1,0 +1,15 @@
+pyproject.toml
+vsphere_monitor/__init__.py
+vsphere_monitor/__main__.py
+vsphere_monitor/analyzer.py
+vsphere_monitor/cli.py
+vsphere_monitor/fetcher.py
+vsphere_monitor/formatters.py
+vsphere_monitor/llm.py
+vsphere_monitor/tui.py
+vsphere_prow_monitor.egg-info/PKG-INFO
+vsphere_prow_monitor.egg-info/SOURCES.txt
+vsphere_prow_monitor.egg-info/dependency_links.txt
+vsphere_prow_monitor.egg-info/entry_points.txt
+vsphere_prow_monitor.egg-info/requires.txt
+vsphere_prow_monitor.egg-info/top_level.txt

@@ -1,0 +1,2 @@
+[console_scripts]
+vsphere-monitor = vsphere_monitor.cli:main
