@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import re
+import webbrowser
 from pathlib import Path
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, RichLog, Static
+from textual.containers import VerticalScroll
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Checkbox, DataTable, Footer, Header, RichLog, Static
 from textual.worker import Worker, WorkerState
-
-from rich.text import Text
 
 from vsphere_monitor.analyzer import JobSummary, analyze
 from vsphere_monitor.fetcher import fetch, fetch_build_log
@@ -30,6 +31,20 @@ _STATE_DISPLAY: dict[str, str] = {
 _SORT_KEYS = ["recent", "version", "failure_rate", "state"]
 _STATE_FILTERS = [None, "failure", "success", "pending", "aborted", "error"]
 
+# Column registry: (key, display_label)
+ALL_COLUMNS: list[tuple[str, str]] = [
+    ("ver", "VER"),
+    ("status", "STATUS"),
+    ("recent", "RECENT"),
+    ("fail_pct", "FAIL%"),
+    ("last_ok", "LAST OK"),
+    ("started", "STARTED"),
+    ("duration", "DURATION"),
+    ("type", "TYPE"),
+    ("job_name", "JOB NAME"),
+    ("url", "URL"),
+]
+
 # Patterns to highlight as errors in build logs
 _ERROR_RE = re.compile(
     r"(error|ERROR|FAIL|FAILED|fatal|FATAL|panic|PANIC|timed?\s*out"
@@ -38,14 +53,21 @@ _ERROR_RE = re.compile(
 
 
 def _sparkline_plain(summary: JobSummary) -> str:
-    mapping = {"success": "S", "failure": "F", "pending": "P",
-               "aborted": "A", "error": "E", "triggered": "T"}
+    mapping = {
+        "success": "S",
+        "failure": "F",
+        "pending": "P",
+        "aborted": "A",
+        "error": "E",
+        "triggered": "T",
+    }
     return "".join(mapping.get(s, "?") for s in summary.recent_states)
 
 
 # ---------------------------------------------------------------------------
 # Log viewer screen
 # ---------------------------------------------------------------------------
+
 
 class LogViewerScreen(Screen):
     """Full-screen build log viewer with error highlighting."""
@@ -86,9 +108,7 @@ class LogViewerScreen(Screen):
 
         if event.state == WorkerState.SUCCESS:
             log_url, lines = event.worker.result
-            status.update(
-                f"[dim]{self._job_name}  |  {len(lines)} lines  |  {log_url}[/]"
-            )
+            status.update(f"[dim]{self._job_name}  |  {len(lines)} lines  |  {log_url}[/]")
 
             for line in lines:
                 if _ERROR_RE.search(line):
@@ -99,8 +119,70 @@ class LogViewerScreen(Screen):
 
 
 # ---------------------------------------------------------------------------
+# Column visibility screen
+# ---------------------------------------------------------------------------
+
+
+class ColumnToggleScreen(ModalScreen[set[str]]):
+    """Modal dialog for toggling column visibility."""
+
+    CSS = """
+    ColumnToggleScreen {
+        align: center middle;
+    }
+    #col-toggle-container {
+        width: 40;
+        max-height: 20;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #col-toggle-title {
+        text-align: center;
+        text-style: bold;
+        width: 100%;
+        margin-bottom: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_screen", "Done"),
+        Binding("enter", "dismiss_screen", "Done"),
+    ]
+
+    def __init__(self, visible: set[str]) -> None:
+        super().__init__()
+        self._visible = set(visible)
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="col-toggle-container"):
+            yield Static("Toggle Columns", id="col-toggle-title")
+            for key, label in ALL_COLUMNS:
+                yield Checkbox(label, value=key in self._visible, id=f"col-{key}")
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        col_key = event.checkbox.id
+        if col_key is None:
+            return
+        col_key = col_key.removeprefix("col-")
+        if event.value:
+            self._visible.add(col_key)
+        else:
+            # Prevent hiding all columns
+            if len(self._visible) > 1:
+                self._visible.discard(col_key)
+            else:
+                event.checkbox.value = True
+                self.notify("At least one column must remain visible")
+
+    def action_dismiss_screen(self) -> None:
+        self.dismiss(self._visible)
+
+
+# ---------------------------------------------------------------------------
 # Stats bar
 # ---------------------------------------------------------------------------
+
 
 class StatsBar(Static):
     """Displays aggregate stats and active filters."""
@@ -159,6 +241,7 @@ class StatsBar(Static):
 # Main app
 # ---------------------------------------------------------------------------
 
+
 class ProwMonitorApp(App):
     """Textual app for browsing vSphere Prow periodic jobs."""
 
@@ -193,6 +276,8 @@ class ProwMonitorApp(App):
         Binding("s", "cycle_state", "Cycle state"),
         Binding("o", "cycle_sort", "Cycle sort"),
         Binding("c", "clear_filters", "Clear filters"),
+        Binding("w", "open_prow_url", "Open in browser"),
+        Binding("h", "toggle_columns", "Columns"),
         Binding("escape", "quit", "Quit"),
         Binding("q", "quit", "Quit"),
     ]
@@ -210,6 +295,7 @@ class ProwMonitorApp(App):
         self._state_idx = 0
         self._sort_idx = 0
         self._displayed: list[JobSummary] = []
+        self._visible_columns: set[str] = {key for key, _ in ALL_COLUMNS}
 
     def _rebuild_versions(self) -> None:
         self._versions: list[str | None] = [None] + sorted(
@@ -236,37 +322,55 @@ class ProwMonitorApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._rebuild_table()
+
+    def _row_data(self, s: JobSummary) -> dict[str, str]:
+        """Build a dict of column key -> cell value for a single summary."""
+        short_url = s.latest_url
+        if "test-platform-results/logs/" in short_url:
+            short_url = short_url.split("test-platform-results/logs/")[-1]
+        return {
+            "ver": s.ocp_version,
+            "status": _STATE_DISPLAY.get(s.latest_state, s.latest_state.upper()),
+            "recent": _sparkline_plain(s),
+            "fail_pct": f"{s.failure_rate:.0%}",
+            "last_ok": s.last_success_age,
+            "started": s.latest_start_display,
+            "duration": s.latest_duration,
+            "type": s.job_variant,
+            "job_name": s.job,
+            "url": short_url,
+        }
+
+    def _active_columns(self) -> list[tuple[str, str]]:
+        """Return the ordered list of (key, label) for currently visible columns."""
+        return [(k, lbl) for k, lbl in ALL_COLUMNS if k in self._visible_columns]
+
+    def _rebuild_table(self) -> None:
+        """Clear columns and rows, re-add visible columns, then populate rows."""
         table = self.query_one(DataTable)
-        table.add_columns(
-            "VER", "STATUS", "RECENT", "FAIL%", "LAST OK",
-            "TYPE", "JOB NAME", "URL",
-        )
+        table.clear(columns=True)
+        cols = self._active_columns()
+        table.add_columns(*(lbl for _, lbl in cols))
         self._refresh_table()
 
     def _refresh_table(self) -> None:
+        """Clear rows and re-populate based on current filters/sort."""
         table = self.query_one(DataTable)
         table.clear()
 
-        filtered = filter_summaries(
-            self._all_summaries, self._version_filter, self._state_filter
-        )
+        filtered = filter_summaries(self._all_summaries, self._version_filter, self._state_filter)
         self._displayed = sort_summaries(filtered, self._sort_by)
 
+        cols = self._active_columns()
+        highlight_failures = self._state_filter is None
         for s in self._displayed:
-            short_url = s.latest_url
-            if "test-platform-results/logs/" in short_url:
-                short_url = short_url.split("test-platform-results/logs/")[-1]
-
-            table.add_row(
-                s.ocp_version,
-                _STATE_DISPLAY.get(s.latest_state, s.latest_state.upper()),
-                _sparkline_plain(s),
-                f"{s.failure_rate:.0%}",
-                s.last_success_age,
-                s.job_variant,
-                s.job,
-                short_url,
-            )
+            data = self._row_data(s)
+            values = [data[key] for key, _ in cols]
+            if highlight_failures and s.latest_state in ("failure", "error"):
+                table.add_row(*(Text(v, style="red") for v in values))
+            else:
+                table.add_row(*values)
 
         self.query_one(StatsBar).update_filters(
             self._version_filter, self._state_filter, self._sort_by
@@ -307,9 +411,7 @@ class ProwMonitorApp(App):
             self._version_idx = min(self._version_idx, len(self._versions) - 1)
             self.query_one(StatsBar).set_summaries(self._all_summaries)
             self._refresh_table()
-            self.notify(
-                f"Reloaded: {len(self._all_summaries)} jobs", severity="information"
-            )
+            self.notify(f"Reloaded: {len(self._all_summaries)} jobs", severity="information")
 
     # -- filter/sort actions -----------------------------------------------
 
@@ -330,6 +432,32 @@ class ProwMonitorApp(App):
         self._state_idx = 0
         self._sort_idx = 0
         self._refresh_table()
+
+    # -- w: open prow URL in browser ---------------------------------------
+
+    def action_open_prow_url(self) -> None:
+        table = self.query_one(DataTable)
+        row_idx = table.cursor_row
+        if row_idx is not None and 0 <= row_idx < len(self._displayed):
+            summary = self._displayed[row_idx]
+            url = summary.latest_url
+            if url:
+                webbrowser.open(url)
+                self.notify(f"Opened {summary.job} in browser")
+            else:
+                self.notify("No URL available for this job", severity="warning")
+        else:
+            self.notify("No row selected", severity="warning")
+
+    # -- h: toggle column visibility ---------------------------------------
+
+    def action_toggle_columns(self) -> None:
+        def _on_dismiss(result: set[str] | None) -> None:
+            if result is not None:
+                self._visible_columns = result
+                self._rebuild_table()
+
+        self.push_screen(ColumnToggleScreen(self._visible_columns), callback=_on_dismiss)
 
 
 def run_interactive(

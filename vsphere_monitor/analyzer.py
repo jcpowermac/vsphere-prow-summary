@@ -76,6 +76,25 @@ class JobSummary:
         return f"{int(hours / 24)}d ago"
 
     @property
+    def latest_start_display(self) -> str:
+        """Human-readable start time of the latest run, e.g. 'Feb 25 14:30'."""
+        return self.latest_run.start_time.strftime("%b %d %H:%M")
+
+    @property
+    def latest_duration(self) -> str:
+        """Duration of the latest run as HH:MM:SS, or '--:--:--' if still running."""
+        run = self.latest_run
+        if run.completion_time is None:
+            return "--:--:--"
+        delta = run.completion_time - run.start_time
+        total_secs = int(delta.total_seconds())
+        if total_secs < 0:
+            return "00:00:00"
+        hours, remainder = divmod(total_secs, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    @property
     def recent_states(self) -> list[str]:
         """Last N run states, most recent first."""
         return [r.state for r in self.runs[:6]]
@@ -112,10 +131,14 @@ def _extract_variant(job_name: str) -> str:
     """Extract a short variant description from the job name."""
     # Strip common prefixes
     name = job_name
-    for prefix in ("periodic-ci-openshift-release-main-", "periodic-ci-openshift-",
-                   "openshift-", "release-"):
+    for prefix in (
+        "periodic-ci-openshift-release-main-",
+        "periodic-ci-openshift-",
+        "openshift-",
+        "release-",
+    ):
         if name.startswith(prefix):
-            name = name[len(prefix):]
+            name = name[len(prefix) :]
             break
 
     # Identify key variants
@@ -166,14 +189,16 @@ def extract_vsphere_periodic(raw: dict[str, Any]) -> list[JobRun]:
         if start is None:
             continue
 
-        runs.append(JobRun(
-            job=job_name,
-            state=status.get("state", "unknown"),
-            start_time=start,
-            completion_time=_parse_time(status.get("completionTime")),
-            url=status.get("url", ""),
-            build_id=status.get("build_id", ""),
-        ))
+        runs.append(
+            JobRun(
+                job=job_name,
+                state=status.get("state", "unknown"),
+                start_time=start,
+                completion_time=_parse_time(status.get("completionTime")),
+                url=status.get("url", ""),
+                build_id=status.get("build_id", ""),
+            )
+        )
 
     return runs
 
@@ -188,12 +213,14 @@ def aggregate(runs: list[JobRun]) -> list[JobSummary]:
     for job_name, job_runs in sorted(by_job.items()):
         # Sort runs most-recent-first
         job_runs.sort(key=lambda r: r.start_time, reverse=True)
-        summaries.append(JobSummary(
-            job=job_name,
-            ocp_version=_extract_ocp_version(job_name),
-            job_variant=_extract_variant(job_name),
-            runs=job_runs,
-        ))
+        summaries.append(
+            JobSummary(
+                job=job_name,
+                ocp_version=_extract_ocp_version(job_name),
+                job_variant=_extract_variant(job_name),
+                runs=job_runs,
+            )
+        )
 
     return summaries
 
@@ -212,10 +239,12 @@ def build_compact_summary(summaries: list[JobSummary]) -> str:
     """
     lines: list[str] = []
     lines.append("VSPHERE PERIODIC JOB STATUS REPORT")
-    lines.append(f"Jobs: {len(summaries)} | "
-                 f"Failing: {sum(1 for s in summaries if s.latest_state == 'failure')} | "
-                 f"Passing: {sum(1 for s in summaries if s.latest_state == 'success')} | "
-                 f"Pending: {sum(1 for s in summaries if s.latest_state == 'pending')}")
+    lines.append(
+        f"Jobs: {len(summaries)} | "
+        f"Failing: {sum(1 for s in summaries if s.latest_state == 'failure')} | "
+        f"Passing: {sum(1 for s in summaries if s.latest_state == 'success')} | "
+        f"Pending: {sum(1 for s in summaries if s.latest_state == 'pending')}"
+    )
     lines.append("")
 
     # Group by version

@@ -63,7 +63,13 @@ def sort_summaries(
     elif sort_by == "version":
         result.sort(key=lambda s: (s.ocp_version == "unknown", s.ocp_version, s.job))
     elif sort_by == "state":
-        state_order = {"failure": 0, "error": 1, "pending": 2, "aborted": 3, "success": 4}
+        state_order = {
+            "failure": 0,
+            "error": 1,
+            "pending": 2,
+            "aborted": 3,
+            "success": 4,
+        }
         result.sort(key=lambda s: (state_order.get(s.latest_state, 5), s.job))
     return result
 
@@ -102,6 +108,8 @@ def _build_table(
     table.add_column("RECENT", no_wrap=True)
     table.add_column("FAIL%", no_wrap=True)
     table.add_column("LAST OK", no_wrap=True)
+    table.add_column("STARTED", no_wrap=True)
+    table.add_column("DURATION", no_wrap=True)
     table.add_column("TYPE", style="dim", no_wrap=True)
     table.add_column("JOB NAME", no_wrap=True)
     table.add_column("URL", style="dim", no_wrap=True)
@@ -124,6 +132,8 @@ def _build_table(
             _sparkline(s),
             _fail_rate_text(s.failure_rate),
             s.last_success_age,
+            s.latest_start_display,
+            s.latest_duration,
             s.job_variant,
             s.job,
             short_url,
@@ -172,20 +182,19 @@ def print_json(
 
     output: list[dict[str, Any]] = []
     for s in filtered:
-        output.append({
-            "job": s.job,
-            "ocp_version": s.ocp_version,
-            "variant": s.job_variant,
-            "latest_state": s.latest_state,
-            "failure_rate": round(s.failure_rate, 3),
-            "total_runs": s.total_runs,
-            "failure_count": s.failure_count,
-            "last_success_age": s.last_success_age,
-            "recent_states": s.recent_states,
-            "latest_url": s.latest_url,
-        })
+        output.append(
+            {
+                "job": s.job,
+                "ocp_version": s.ocp_version,
+                "variant": s.job_variant,
+                "latest_state": s.latest_state,
+                "failure_rate": round(s.failure_rate, 3),
+                "total_runs": s.total_runs,
+                "failure_count": s.failure_count,
+                "last_success_age": s.last_success_age,
+                "recent_states": s.recent_states,
+                "latest_url": s.latest_url,
+            }
+        )
 
     print(json.dumps(output, indent=2))
-
-
-
