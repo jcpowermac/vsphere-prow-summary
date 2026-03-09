@@ -17,6 +17,7 @@ from textual.worker import Worker, WorkerState
 from vsphere_monitor.analyzer import JobSummary, analyze
 from vsphere_monitor.fetcher import fetch, fetch_build_log
 from vsphere_monitor.formatters import filter_summaries, sort_summaries
+from vsphere_monitor.installer import fetch_install_statuses_async
 
 # State display mapping
 _STATE_DISPLAY: dict[str, str] = {
@@ -35,6 +36,7 @@ _STATE_FILTERS = [None, "failure", "success", "pending", "aborted", "error"]
 ALL_COLUMNS: list[tuple[str, str]] = [
     ("ver", "VER"),
     ("status", "STATUS"),
+    ("install", "INSTALL"),
     ("recent", "RECENT"),
     ("fail_pct", "FAIL%"),
     ("last_ok", "LAST OK"),
@@ -180,6 +182,76 @@ class ColumnToggleScreen(ModalScreen[set[str]]):
 
 
 # ---------------------------------------------------------------------------
+# Version selection screen
+# ---------------------------------------------------------------------------
+
+
+class VersionSelectScreen(ModalScreen[set[str]]):
+    """Modal dialog for selecting one or more OCP versions to filter by."""
+
+    CSS = """
+    VersionSelectScreen {
+        align: center middle;
+    }
+    #ver-select-container {
+        width: 40;
+        max-height: 24;
+        background: $surface;
+        border: tall $primary;
+        padding: 1 2;
+    }
+    #ver-select-title {
+        text-align: center;
+        text-style: bold;
+        width: 100%;
+        margin-bottom: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_screen", "Done"),
+        Binding("enter", "dismiss_screen", "Done"),
+    ]
+
+    def __init__(self, versions: list[str], selected: set[str]) -> None:
+        super().__init__()
+        self._versions = versions
+        self._selected = set(selected)
+
+    @staticmethod
+    def _ver_to_id(ver: str) -> str:
+        """Convert a version string to a valid Textual widget id."""
+        return f"ver-{ver.replace('.', '-')}"
+
+    @staticmethod
+    def _id_to_ver(widget_id: str) -> str:
+        """Convert a widget id back to a version string (e.g. 'ver-4-18' -> '4.18')."""
+        raw = widget_id.removeprefix("ver-")
+        # Re-insert the dot after the major version digit(s)
+        parts = raw.split("-", 1)
+        return ".".join(parts) if len(parts) == 2 else raw
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="ver-select-container"):
+            yield Static("Filter Versions (empty = all)", id="ver-select-title")
+            for ver in self._versions:
+                yield Checkbox(ver, value=ver in self._selected, id=self._ver_to_id(ver))
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        cb_id = event.checkbox.id
+        if cb_id is None:
+            return
+        ver = self._id_to_ver(cb_id)
+        if event.value:
+            self._selected.add(ver)
+        else:
+            self._selected.discard(ver)
+
+    def action_dismiss_screen(self) -> None:
+        self.dismiss(self._selected)
+
+
+# ---------------------------------------------------------------------------
 # Stats bar
 # ---------------------------------------------------------------------------
 
@@ -190,7 +262,7 @@ class StatsBar(Static):
     def __init__(self, summaries: list[JobSummary]) -> None:
         super().__init__()
         self._all = summaries
-        self._version_filter: str | None = None
+        self._version_filter: list[str] | None = None
         self._state_filter: str | None = None
         self._sort_by: str = "recent"
 
@@ -200,7 +272,7 @@ class StatsBar(Static):
 
     def update_filters(
         self,
-        version_filter: str | None,
+        version_filter: list[str] | None,
         state_filter: str | None,
         sort_by: str,
     ) -> None:
@@ -227,7 +299,7 @@ class StatsBar(Static):
 
         filters: list[str] = []
         if self._version_filter:
-            filters.append(f"ver={self._version_filter}")
+            filters.append(f"ver={','.join(sorted(self._version_filter))}")
         if self._state_filter:
             filters.append(f"state={self._state_filter}")
         if filters:
@@ -272,7 +344,7 @@ class ProwMonitorApp(App):
 
     BINDINGS = [
         Binding("r", "reload", "Reload data"),
-        Binding("v", "cycle_version", "Cycle version"),
+        Binding("v", "select_versions", "Filter versions"),
         Binding("s", "cycle_state", "Cycle state"),
         Binding("o", "cycle_sort", "Cycle sort"),
         Binding("c", "clear_filters", "Clear filters"),
@@ -291,21 +363,22 @@ class ProwMonitorApp(App):
         self._all_summaries = summaries
         self._file_path = file_path
         self._rebuild_versions()
-        self._version_idx = 0
+        self._selected_versions: set[str] = set()
         self._state_idx = 0
         self._sort_idx = 0
         self._displayed: list[JobSummary] = []
         self._visible_columns: set[str] = {key for key, _ in ALL_COLUMNS}
 
     def _rebuild_versions(self) -> None:
-        self._versions: list[str | None] = [None] + sorted(
+        self._available_versions: list[str] = sorted(
             set(s.ocp_version for s in self._all_summaries),
             key=lambda v: (v == "unknown", v),
         )
 
     @property
-    def _version_filter(self) -> str | None:
-        return self._versions[self._version_idx]
+    def _version_filter(self) -> list[str] | None:
+        """Return selected versions as a list, or None if nothing is selected (show all)."""
+        return sorted(self._selected_versions) if self._selected_versions else None
 
     @property
     def _state_filter(self) -> str | None:
@@ -332,6 +405,7 @@ class ProwMonitorApp(App):
         return {
             "ver": s.ocp_version,
             "status": _STATE_DISPLAY.get(s.latest_state, s.latest_state.upper()),
+            "install": s.install_status,
             "recent": _sparkline_plain(s),
             "fail_pct": f"{s.failure_rate:.0%}",
             "last_ok": s.last_success_age,
@@ -389,16 +463,24 @@ class ProwMonitorApp(App):
     # -- r: reload data ----------------------------------------------------
 
     def action_reload(self) -> None:
+        self.sub_title = "[bold cyan]Reloading…[/]"
         self.notify("Reloading data...")
         self.run_worker(self._do_reload(), name="reload", exclusive=True)
 
     async def _do_reload(self) -> list[JobSummary]:
         raw = fetch(file=self._file_path, refresh=True)
-        return analyze(raw)
+        summaries = analyze(raw)
+        statuses = await fetch_install_statuses_async(summaries)
+        for s in summaries:
+            s.install_status = statuses.get(s.job, "--")
+        return summaries
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.worker.name != "reload":
             return
+
+        # Clear reload indicator from header when worker finishes (success or error)
+        self.sub_title = ""
 
         if event.state == WorkerState.ERROR:
             self.notify(f"Reload failed: {event.worker.error}", severity="error")
@@ -407,17 +489,25 @@ class ProwMonitorApp(App):
         if event.state == WorkerState.SUCCESS:
             self._all_summaries = event.worker.result
             self._rebuild_versions()
-            # Clamp filter indices in case versions changed
-            self._version_idx = min(self._version_idx, len(self._versions) - 1)
+            # Drop any selected versions that no longer exist in the data
+            available = set(self._available_versions)
+            self._selected_versions &= available
             self.query_one(StatsBar).set_summaries(self._all_summaries)
             self._refresh_table()
             self.notify(f"Reloaded: {len(self._all_summaries)} jobs", severity="information")
 
     # -- filter/sort actions -----------------------------------------------
 
-    def action_cycle_version(self) -> None:
-        self._version_idx = (self._version_idx + 1) % len(self._versions)
-        self._refresh_table()
+    def action_select_versions(self) -> None:
+        def _on_dismiss(result: set[str] | None) -> None:
+            if result is not None:
+                self._selected_versions = result
+                self._refresh_table()
+
+        self.push_screen(
+            VersionSelectScreen(self._available_versions, self._selected_versions),
+            callback=_on_dismiss,
+        )
 
     def action_cycle_state(self) -> None:
         self._state_idx = (self._state_idx + 1) % len(_STATE_FILTERS)
@@ -428,7 +518,7 @@ class ProwMonitorApp(App):
         self._refresh_table()
 
     def action_clear_filters(self) -> None:
-        self._version_idx = 0
+        self._selected_versions = set()
         self._state_idx = 0
         self._sort_idx = 0
         self._refresh_table()

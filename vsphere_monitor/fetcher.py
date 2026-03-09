@@ -5,17 +5,20 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 PROW_API_URL = (
-    "https://prow.ci.openshift.org/prowjobs.js"
-    "?omit=annotations,decoration_config,pod_spec"
+    "https://prow.ci.openshift.org/prowjobs.js?omit=annotations,decoration_config,pod_spec"
 )
 CACHE_DIR = Path.home() / ".cache" / "vsphere-prow-monitor"
 CACHE_TTL_SECONDS = 30 * 60  # 30 minutes
+
+# Install-status cache persists across invocations, keyed by build_id.
+_INSTALL_CACHE_FILE = CACHE_DIR / "install_status.json"
 
 
 def _cache_path(url: str) -> Path:
@@ -91,7 +94,7 @@ def prow_url_to_build_log_url(prow_url: str) -> str | None:
     idx = prow_url.find(marker)
     if idx == -1:
         return None
-    gcs_path = prow_url[idx + len(marker):]
+    gcs_path = prow_url[idx + len(marker) :]
     return f"https://storage.googleapis.com/{gcs_path}/build-log.txt"
 
 
@@ -109,8 +112,6 @@ def fetch_build_log(prow_url: str, max_lines: int = 5000) -> tuple[str, list[str
     if log_url is None:
         raise ValueError(f"Cannot derive build-log URL from: {prow_url}")
 
-    from collections import deque
-
     tail: deque[str] = deque(maxlen=max_lines)
 
     with httpx.Client(timeout=120, follow_redirects=True) as client:
@@ -127,3 +128,58 @@ def fetch_build_log(prow_url: str, max_lines: int = 5000) -> tuple[str, list[str
                 tail.append(buf)
 
     return log_url, list(tail)
+
+
+async def fetch_build_log_async(
+    prow_url: str,
+    client: httpx.AsyncClient,
+    max_lines: int = 5000,
+) -> list[str]:
+    """Fetch the build-log.txt asynchronously using a shared client.
+
+    Returns the tail lines of the log.
+    Raises ValueError if the URL can't be converted.
+    Raises httpx.HTTPStatusError on fetch failure.
+    """
+    log_url = prow_url_to_build_log_url(prow_url)
+    if log_url is None:
+        raise ValueError(f"Cannot derive build-log URL from: {prow_url}")
+
+    tail: deque[str] = deque(maxlen=max_lines)
+
+    async with client.stream("GET", log_url) as resp:
+        resp.raise_for_status()
+        buf = ""
+        async for chunk in resp.aiter_text():
+            buf += chunk
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                tail.append(line)
+        if buf:
+            tail.append(buf)
+
+    return list(tail)
+
+
+# ---------------------------------------------------------------------------
+# Install-status cache (persists per build_id across invocations)
+# ---------------------------------------------------------------------------
+
+
+def read_install_cache() -> dict[str, str]:
+    """Read the install-status cache from disk.
+
+    Returns a dict mapping build_id -> install phase string.
+    """
+    if not _INSTALL_CACHE_FILE.exists():
+        return {}
+    try:
+        return json.loads(_INSTALL_CACHE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def write_install_cache(data: dict[str, str]) -> None:
+    """Write the install-status cache to disk."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _INSTALL_CACHE_FILE.write_text(json.dumps(data))

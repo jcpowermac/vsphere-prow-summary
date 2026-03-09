@@ -7,11 +7,12 @@ import sys
 
 from rich.console import Console
 
-from vsphere_monitor.fetcher import fetch
 from vsphere_monitor.analyzer import analyze, build_compact_summary
-from vsphere_monitor.formatters import print_table, print_json
-from vsphere_monitor.tui import run_interactive
+from vsphere_monitor.fetcher import fetch
+from vsphere_monitor.formatters import print_json, print_table
+from vsphere_monitor.installer import fetch_install_statuses
 from vsphere_monitor.llm import ask
+from vsphere_monitor.tui import run_interactive
 
 console = Console(stderr=True)
 
@@ -24,7 +25,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Data source
     p.add_argument(
-        "--file", "-f",
+        "--file",
+        "-f",
         metavar="PATH",
         help="Read from a local prowjobs.json instead of the Prow API",
     )
@@ -44,12 +46,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output format (default: table)",
     )
     mode.add_argument(
-        "--interactive", "-i",
+        "--interactive",
+        "-i",
         action="store_true",
         help="Launch interactive TUI mode",
     )
     mode.add_argument(
-        "--ask", "-a",
+        "--ask",
+        "-a",
         metavar="QUESTION",
         help="Ask a natural language question about job status (requires ANTHROPIC_API_KEY)",
     )
@@ -61,12 +65,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Filters
     p.add_argument(
-        "--version", "-v",
+        "--version",
+        "-v",
         metavar="VER",
-        help="Filter by OCP version (e.g. 4.18)",
+        action="append",
+        help="Filter by OCP version (repeatable, e.g. -v 4.21 -v 4.22)",
     )
     p.add_argument(
-        "--state", "-s",
+        "--state",
+        "-s",
         choices=["success", "failure", "pending", "aborted", "error"],
         help="Filter by job state",
     )
@@ -100,9 +107,13 @@ def main(argv: list[str] | None = None) -> None:
         console.print("[yellow]No vSphere periodic jobs found in the data.[/]")
         sys.exit(0)
 
-    console.print(
-        f"[dim]Found {len(summaries)} unique vSphere periodic jobs[/]"
-    )
+    console.print(f"[dim]Found {len(summaries)} unique vSphere periodic jobs[/]")
+
+    # Check install status for failed jobs
+    with console.status("[bold cyan]Checking install status for failed jobs..."):
+        statuses = fetch_install_statuses(summaries, stderr=console)
+        for s in summaries:
+            s.install_status = statuses.get(s.job, "--")
 
     # Dispatch to output mode
     if args.interactive:

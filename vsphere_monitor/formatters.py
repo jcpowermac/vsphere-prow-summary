@@ -50,6 +50,26 @@ def _fail_rate_text(rate: float) -> Text:
     return Text(pct, style="green")
 
 
+# Install phase -> (color, display label)
+_INSTALL_STYLE: dict[str, tuple[str, str]] = {
+    "ok": ("green", "ok"),
+    "infra": ("magenta", "infra"),
+    "manifests": ("red", "manifests"),
+    "ignition": ("red", "ignition"),
+    "bootstrap": ("red", "bootstrap"),
+    "install": ("red", "install"),
+    "terraform": ("red", "terraform"),
+    "unknown": ("yellow", "unknown"),
+    "--": ("dim", "--"),
+}
+
+
+def _styled_install_status(status: str) -> Text:
+    """Return a styled Text for the install phase column."""
+    color, label = _INSTALL_STYLE.get(status, ("dim", status))
+    return Text(label, style=color)
+
+
 def sort_summaries(
     summaries: list[JobSummary],
     sort_by: str = "recent",
@@ -76,13 +96,19 @@ def sort_summaries(
 
 def filter_summaries(
     summaries: list[JobSummary],
-    version_filter: str | None = None,
+    version_filter: list[str] | None = None,
     state_filter: str | None = None,
 ) -> list[JobSummary]:
-    """Filter summaries by version and/or state."""
+    """Filter summaries by version(s) and/or state.
+
+    ``version_filter`` may contain one or more OCP versions (e.g.
+    ``["4.21", "4.22"]``).  When provided, only summaries whose
+    ``ocp_version`` is in the list are kept.
+    """
     result = summaries
     if version_filter:
-        result = [s for s in result if s.ocp_version == version_filter]
+        version_set = set(version_filter)
+        result = [s for s in result if s.ocp_version in version_set]
     if state_filter:
         result = [s for s in result if s.latest_state == state_filter]
     return result
@@ -90,7 +116,7 @@ def filter_summaries(
 
 def _build_table(
     summaries: list[JobSummary],
-    version_filter: str | None = None,
+    version_filter: list[str] | None = None,
     state_filter: str | None = None,
     sort_by: str = "recent",
 ) -> Table:
@@ -105,6 +131,7 @@ def _build_table(
     )
     table.add_column("VER", style="cyan", no_wrap=True)
     table.add_column("STATUS", no_wrap=True)
+    table.add_column("INSTALL", no_wrap=True)
     table.add_column("RECENT", no_wrap=True)
     table.add_column("FAIL%", no_wrap=True)
     table.add_column("LAST OK", no_wrap=True)
@@ -129,6 +156,7 @@ def _build_table(
         table.add_row(
             s.ocp_version,
             _styled_state(s.latest_state),
+            _styled_install_status(s.install_status),
             _sparkline(s),
             _fail_rate_text(s.failure_rate),
             s.last_success_age,
@@ -144,7 +172,7 @@ def _build_table(
 
 def print_table(
     summaries: list[JobSummary],
-    version_filter: str | None = None,
+    version_filter: list[str] | None = None,
     state_filter: str | None = None,
     sort_by: str = "recent",
 ) -> None:
@@ -170,15 +198,11 @@ def print_table(
 
 def print_json(
     summaries: list[JobSummary],
-    version_filter: str | None = None,
+    version_filter: list[str] | None = None,
     state_filter: str | None = None,
 ) -> None:
     """Print JSON output for machine consumption."""
-    filtered = summaries
-    if version_filter:
-        filtered = [s for s in filtered if s.ocp_version == version_filter]
-    if state_filter:
-        filtered = [s for s in filtered if s.latest_state == state_filter]
+    filtered = filter_summaries(summaries, version_filter, state_filter)
 
     output: list[dict[str, Any]] = []
     for s in filtered:
@@ -188,6 +212,7 @@ def print_json(
                 "ocp_version": s.ocp_version,
                 "variant": s.job_variant,
                 "latest_state": s.latest_state,
+                "install_status": s.install_status,
                 "failure_rate": round(s.failure_rate, 3),
                 "total_runs": s.total_runs,
                 "failure_count": s.failure_count,

@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+# Minimum OCP version to include in results.  Anything older is EOL and
+# excluded from monitoring.
+_MIN_OCP_VERSION = "4.12"
+
 
 @dataclass
 class JobRun:
@@ -28,6 +32,7 @@ class JobSummary:
     ocp_version: str
     job_variant: str  # e.g. "e2e-vsphere-ovn", "upgrade", "serial"
     runs: list[JobRun] = field(default_factory=list)
+    install_status: str = "--"  # populated by installer.fetch_install_statuses()
 
     @property
     def latest_run(self) -> JobRun:
@@ -184,6 +189,11 @@ def extract_vsphere_periodic(raw: dict[str, Any]) -> list[JobRun]:
         if "vsphere" not in job_name.lower():
             continue
 
+        # Skip end-of-life versions
+        ver = _extract_ocp_version(job_name)
+        if ver != "unknown" and ver < _MIN_OCP_VERSION:
+            continue
+
         status = item.get("status", {})
         start = _parse_time(status.get("startTime"))
         if start is None:
@@ -259,10 +269,11 @@ def build_compact_summary(summaries: list[JobSummary]) -> str:
 
         for j in jobs:
             fail_pct = f"{j.failure_rate:.0%}"
+            inst = f"inst={j.install_status:<10}" if j.install_status != "--" else " " * 15
             lines.append(
                 f"  {j.latest_state[0].upper()} {j.state_sparkline:<6} "
                 f"fail={fail_pct:<4} last_ok={j.last_success_age:<8} "
-                f"{j.job_variant:<12} {j.job}"
+                f"{j.job_variant:<12} {inst} {j.job}"
             )
         lines.append("")
 
